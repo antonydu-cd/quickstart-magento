@@ -129,7 +129,7 @@ Parameters:
       - m4.xlarge
       - m4.2xlarge
       - m4.4xlarge
-    Default: t2.micro
+    Default: t2.medium
     Description: Amazon EC2 instance type for the bastion instances.
     Type: String
   EnableBanner:
@@ -431,6 +431,9 @@ Resources:
         Statement:
           - Action:
               - 's3:GetObject'
+              - 's3:GetObjectVersion'
+              - 's3:PutObject'
+              - 's3:DeleteObject'
             Resource: !Sub
               - arn:${AWS::Partition}:s3:::${S3Bucket}/${QSS3KeyPrefix}*
               - S3Bucket: !If [UsingDefaultBucket, !Sub '${QSS3BucketName}-${AWS::Region}', !Ref QSS3BucketName]
@@ -449,6 +452,16 @@ Resources:
           - Action:
               - 'ec2:AssociateAddress'
               - 'ec2:DescribeAddresses'
+            Resource: '*'
+            Effect: Allow
+          - Action:
+              - 'codedeploy:ListApplications'
+              - 'codedeploy:ListDeploymentGroups'
+              - 'codedeploy:RegisterApplicationRevision'
+              - 'codedeploy:CreateDeployment'
+              - 'codedeploy:GetDeploymentConfig'
+              - 'codedeploy:GetApplicationRevision'
+              - 'codedeploy:GetDeployment'
             Resource: '*'
             Effect: Allow
       Roles:
@@ -564,6 +577,92 @@ Resources:
               owner: root
               group: root
               authentication: S3AccessCreds
+            /etc/nginx/nginx.conf:
+              content: !Join 
+                - ''
+                - - |
+                    user  nginx;
+                  - |+
+                    worker_processes  1;
+
+                  - |
+                    error_log  /var/log/nginx/error.log;
+                  - |+
+                    pid        /var/run/nginx.pid;
+
+                  - |
+                    events {
+                  - |2
+                        worker_connections  1024;
+                  - |+
+                    }
+
+                  - |
+                    http {
+                  - |2
+                        include       /etc/nginx/mime.types;
+                  - |2
+                        default_type  application/octet-stream;
+                  - |2
+                        log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                  - |2
+                                          '$status $body_bytes_sent "$http_referer" '
+                  - |2+
+                                          '"$http_user_agent" "$http_x_forwarded_for"';
+
+                  - |2
+                        access_log  /var/log/nginx/access.log  main;
+                  - |2
+                        sendfile        on;
+                  - |2
+                        keepalive_timeout  65;
+                  - |2
+                        include /etc/nginx/conf.d/*.conf;
+                  - |2
+                        index   index.html index.htm;
+                  - |2
+                        server {
+                  - |2
+                            listen       80;
+                  - |2
+                            server_name  _;
+                  - |2
+                            location / {
+                  - |2
+                              proxy_pass              http://127.0.0.1:8080;
+                  - |2
+                              proxy_set_header        Host $host;
+                  - |2
+                              proxy_set_header        X-Real-IP $remote_addr;
+                  - |2
+                              proxy_set_header        X-Forwarded-For $proxy_add_x_forwarded_for;
+                  - |2
+                              proxy_connect_timeout   150;
+                  - |2
+                              proxy_send_timeout      100;
+                  - |2
+                              proxy_read_timeout      100;
+                  - |2
+                              proxy_buffers           4 32k;
+                  - |2
+                              client_max_body_size    8m;
+                  - |2
+                              client_body_buffer_size 128k;
+                  - |2
+                            }
+                  - |2
+                            location /password.txt {
+                  - |2
+                              alias              /web/initalpass.html;
+                  - |2
+                            }
+                  - |2
+                        }
+                  - |
+                    }
+              mode: '000444'
+              owner: root
+              group: root
           commands:
             a-add_auditd_rules:
               cwd: '/tmp/'
@@ -587,6 +686,16 @@ Resources:
                     - s3://${S3Bucket}/${QSS3KeyPrefix}scripts/banner_message.txt
                     - S3Bucket: !If [ UsingDefaultBucket, !Sub 'aws-quickstart-${AWS::Region}', !Ref 'QSS3BucketName' ]
                   - !Ref BastionBanner
+          packages:
+            yum:
+              nginx: []
+      services:
+        sysvinit:
+          nginx:
+            enabled: 'true'
+            ensureRunning: 'true'
+            files:
+              - /etc/nginx/nginx.conf
     Properties:
       AssociatePublicIpAddress: true
       PlacementTenancy: !Ref BastionTenancy
@@ -623,6 +732,7 @@ Resources:
             export PATH=$PATH:/usr/local/bin
             #cfn signaling functions
             yum install git -y || apt-get install -y git || zypper -n install git
+            amazon-linux-extras install epel
 
             function cfn_fail
             {
@@ -646,6 +756,30 @@ Resources:
             EIP_LIST="${EIP1},${EIP2},${EIP3},${EIP4}"
             CLOUDWATCHGROUP=${BastionMainLogGroup}
             cfn-init -v --stack '${AWS::StackName}' --resource BastionLaunchConfiguration --region ${AWS::Region} || cfn_fail
+
+            # Install Jenkins and Java8
+            sudo yum install wget -y
+            sudo wget -O /etc/yum.repos.d/jenkins.repo https://pkg.jenkins.io/redhat-stable/jenkins.repo
+            sudo rpm --import https://pkg.jenkins.io/redhat-stable/jenkins.io.key
+            sudo yum install java-1.8.0-openjdk -y
+            sudo yum update -y
+            sudo yum install jenkins -y
+            sudo service jenkins start
+            sudo chkconfig jenkins on
+            # Update the AWS CLI to the latest version
+            sudo yum update -y aws-cli
+            # Wait 30 seconds to allow Jenkins to startup
+            echo "Waiting 30 seconds for Jenkins to start....."
+            sleep 30
+            # Configure AWS CLI and GIT for jenkins user
+            sudo su - jenkins --shell /bin/bash -c "aws configure set region us-west-1" 
+            sudo su - jenkins --shell /bin/bash -c "aws configure set output json" 
+            sudo mkdir /web
+            cp /var/lib/jenkins/secrets/initialAdminPassword /web/initalpass.html
+            chown nginx:nginx /web/initalpass.html 
+            ## Nginx setup
+            service nginx restart
+
             [ $(qs_status) == 0 ] && cfn_success || cfn_fail
           - EIP2:
               !If
@@ -672,10 +806,40 @@ Resources:
           FromPort: 22
           ToPort: 22
           CidrIp: !Ref RemoteAccessCIDR
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
         - IpProtocol: icmp
           FromPort: -1
           ToPort: -1
           CidrIp: !Ref RemoteAccessCIDR
+  CodeDeployBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+  BastionBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref CodeDeployBucket
+      PolicyDocument:
+        Statement:
+          - Sid: IPAllow
+            Effect: Allow
+            Action:
+              - 's3:Get*'
+              - 's3:List*'
+            Resource: !Join 
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref CodeDeployBucket
+                - /*
+            Principal: '*'
+            Condition:
+              IpAddress:
+                'aws:SourceIp':
+                  - !Ref EIP1
 Outputs:
   BastionAutoScalingGroup:
     Description: Auto Scaling Group Reference ID
@@ -723,3 +887,6 @@ Outputs:
       - !Ref AlternativeIAMRole
     Export:
       Name: !Sub '${AWS::StackName}-BastionHostRole'
+  DeployS3BucketName:
+    Description: Deploy S3 Bucket Name
+    Value: !Ref CodeDeployBucket
